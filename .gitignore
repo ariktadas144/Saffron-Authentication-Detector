@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+runs/*
+!runs/.gitkeep
+data/*.zip
+data/manifest*.csv
+data/extracted/
+data/images/
+data/train/
+data/val/
+data/test/
+data/*/*/*
+!data/*/*/.gitkeep
+data/raw/*
+!data/raw/.gitkeep
+*.weights.h5
