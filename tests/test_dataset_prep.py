@@ -62,3 +62,29 @@ def test_sample_level_aggregation():
     p = np.array([.9, .8, .2, .1, .3, .7]); y = np.array([1, 1, 0, 0, 0, 0]); g = np.array(["a", "a", "b", "b", "c", "c"])
     ps, ys = wb.aggregate_by_group(p, y, g)
     assert ys.tolist() == [1, 0, 0] and ps[0] > 0.8 and ps[1] < 0.2 and abs(ps[2] - 0.5) < 1e-6
+
+
+def test_label_shuffle_preserves_groups_and_each_fold_class_counts():
+    import importlib.util
+    script = os.path.join(ROOT, "scripts", "label_shuffle_test.py")
+    spec = importlib.util.spec_from_file_location("label_shuffle_test", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    manifest = pd.DataFrame({
+        "group": ["a", "a", "b", "c", "c", "d", "e", "e", "f"],
+        "label": [0, 0, 1, 0, 0, 1, 0, 0, 1],
+        "fold": [0, 0, 0, 1, 1, 1, 2, 2, 2],
+    })
+    shuffled = module.shuffle_partition_labels(manifest, fold=0, seed=9)
+    assert shuffled.loc[shuffled.fold == 0, "label"].tolist() == [0, 0, 1]
+    for fold in (1, 2):
+        assert (
+            shuffled.loc[shuffled.fold == fold].groupby("group").label.first()
+            .value_counts().sort_index()
+            .equals(
+                manifest.loc[manifest.fold == fold].groupby("group").label.first()
+                .value_counts().sort_index()
+            )
+        )
+    assert (shuffled.groupby("group").label.nunique() == 1).all()

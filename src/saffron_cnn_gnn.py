@@ -20,6 +20,7 @@ import numpy as np
 import tensorflow as tf
 import keras
 from keras import layers
+from manifest_paths import normalize_manifest_paths, normalize_manifest_path
 
 CLASS_NAMES = ["real", "fake"]          # index 0 = real, index 1 = fake (positive)
 HEADS = ["cnn", "gnn", "hafm"]
@@ -43,6 +44,7 @@ class Config:
     mc_samples: int = 16
     imagenet: bool = True
     seed: int = 42
+    capture_invariant: bool = False
     loss_weights: dict = field(default_factory=lambda: {"cnn": 0.5, "gnn": 0.5, "hafm": 1.0})
 
 
@@ -127,8 +129,42 @@ def _build_aug():
     ], name="augment")
 
 
+def normalize_luminance_preserve_chromaticity(images, target=127.5):
+    """Scale RGB channels uniformly per image to normalize luminance, preserving ratios."""
+    luminance = tf.image.rgb_to_grayscale(images)
+    mean_luminance = tf.reduce_mean(luminance, axis=(1, 2, 3), keepdims=True)
+    scale = tf.math.divide_no_nan(
+        tf.cast(target, images.dtype),
+        tf.maximum(mean_luminance, tf.cast(1.0, images.dtype)),
+    )
+    return tf.clip_by_value(images * scale, 0.0, 255.0)
+
+
+def capture_invariant_augment(images):
+    """Apply exposure/gamma perturbations to luminance and sensor noise to RGB."""
+    x = normalize_luminance_preserve_chromaticity(images)
+    luminance = tf.image.rgb_to_grayscale(x)
+    shape = (tf.shape(x)[0], 1, 1, 1)
+    exposure = tf.random.uniform(shape, 0.6, 1.5)
+    gamma = tf.random.uniform(shape, 0.7, 1.4)
+    shifted_luminance = 255.0 * tf.pow(
+        tf.clip_by_value(luminance / 255.0 * exposure, 0.0, 1.0), gamma
+    )
+    luminance_scale = tf.math.divide_no_nan(
+        shifted_luminance, tf.maximum(luminance, 1.0)
+    )
+    x = x * luminance_scale
+    noise_std = tf.random.uniform(shape, 4.0, 16.0)
+    return tf.clip_by_value(
+        x + tf.random.normal(tf.shape(x), 0.0, noise_std), 0.0, 255.0
+    )
+
+
 def make_datasets_from_manifest(train_df, val_df, test_df, cfg: Config):
     """DataFrames need columns: path, label (1 = fake), group.  Returns the same 4 objects as make_datasets()."""
+    train_df = normalize_manifest_paths(train_df, columns=("path",))
+    val_df = normalize_manifest_paths(val_df, columns=("path",))
+    test_df = normalize_manifest_paths(test_df, columns=("path",))
     S, AUTO = cfg.img_size, tf.data.AUTOTUNE
     n_fake = int(train_df.label.sum()); n_real = len(train_df) - n_fake
     w_real, w_fake = len(train_df) / (2 * n_real), len(train_df) / (2 * n_fake)
@@ -136,13 +172,20 @@ def make_datasets_from_manifest(train_df, val_df, test_df, cfg: Config):
     aug = _build_aug()
 
     def raw(df, train):
-        ds = tf.data.Dataset.from_tensor_slices((df.path.values.astype(str), df.label.values.astype("float32")))
+        paths = np.asarray(
+            [normalize_manifest_path(path) for path in df.path], dtype=str
+        )
+        ds = tf.data.Dataset.from_tensor_slices((paths, df.label.values.astype("float32")))
         if train: ds = ds.shuffle(len(df), seed=cfg.seed, reshuffle_each_iteration=True)
         return ds.map(lambda p, l: (_load_image(p, S, train), l[None]), num_parallel_calls=AUTO).batch(cfg.batch)
 
     def _train_map(x, y):
         x = aug(x, training=True)
-        x = tf.clip_by_value(x + tf.random.normal(tf.shape(x), 0.0, 4.0), 0.0, 255.0)
+        if cfg.capture_invariant:
+            x = capture_invariant_augment(x)
+        else:
+            x = x + tf.random.normal(tf.shape(x), 0.0, 4.0)
+        x = tf.clip_by_value(x, 0.0, 255.0)
         return x, {h: y for h in HEADS}, tf.where(y[:, 0] > 0.5, w_fake, w_real)
 
     train = raw(train_df, True).map(_train_map, num_parallel_calls=AUTO).prefetch(AUTO)
@@ -308,7 +351,7 @@ def apply_view(x, name, S):
     raise ValueError(name)
 
 
-def extract_cache(M, raw_ds, cfg: Config, views=VIEWS, T=None, groups=None):
+def extract_cache(M, raw_ds, cfg: Config, views=VIEWS, T=None, groups=None, paths=None):
     """One pass over a *deterministic* (shuffle=False) dataset.
     For each image x view x head we store the MC-mean logit and MC std of the logit.
     Only the small heads are re-sampled T times (trunk runs once per view, deterministic)."""
@@ -332,7 +375,34 @@ def extract_cache(M, raw_ds, cfg: Config, views=VIEWS, T=None, groups=None):
         Zs.append(tf.stack(Zv, 1).numpy()); Us.append(tf.stack(Uv, 1).numpy())
         Ys.append(y.numpy()[:, 0].astype(int))
     return Cache(np.concatenate(Zs), np.concatenate(Us), np.concatenate(Ss), np.concatenate(Ys),
-                 list(views), list(HEADS), None if groups is None else np.asarray(groups).astype(str))
+                 list(views), list(HEADS),
+                 None if groups is None else np.asarray(groups).astype(str),
+                 None if paths is None else np.asarray(paths).astype(str))
+
+
+def save_ood_reference(M, train_df, cfg: Config, out: str, percentile: float = 99.0):
+    """Persist a per-fold CNN embedding centroid and train-distance cutoff."""
+    paths = np.asarray(
+        [normalize_manifest_path(value) for value in train_df.path], dtype=str
+    )
+    ds = tf.data.Dataset.from_tensor_slices(paths)
+    ds = ds.map(
+        lambda path: _load_image(path, cfg.img_size, False),
+        num_parallel_calls=1,
+    ).batch(cfg.batch)
+    batches = []
+    for images in ds:
+        features = M["trunk"](images, training=False)["cnn"]
+        batches.append(features.numpy())
+    embeddings = np.concatenate(batches, axis=0).astype(np.float32)
+    center = embeddings.mean(axis=0)
+    distances = np.linalg.norm(embeddings - center, axis=1)
+    cutoff = float(np.percentile(distances, percentile))
+    np.savez_compressed(
+        os.path.join(out, "ood_reference.npz"),
+        center=center, max_distance=np.asarray(cutoff),
+        percentile=np.asarray(percentile), n_train=np.asarray(len(embeddings)),
+    )
 
 
 def run_fold(manifest, fold, n_folds, cfg: Config, out):
@@ -356,8 +426,13 @@ def run_fold(manifest, fold, n_folds, cfg: Config, out):
     h1, h2 = train(M, train_ds, val_ds, cfg, ckpt=f"{out}/best.weights.h5")
     M["model"].save_weights(f"{out}/final.weights.h5")
     pd.DataFrame(h2.history).to_csv(f"{out}/history_finetune.csv", index=False)
-    extract_cache(M, val_raw, cfg, groups=val_df.group.values).save(f"{out}/cache_val.npz")
-    extract_cache(M, test_raw, cfg, groups=test_df.group.values).save(f"{out}/cache_test.npz")
+    extract_cache(
+        M, val_raw, cfg, groups=val_df.group.values, paths=val_df.path.values
+    ).save(f"{out}/cache_val.npz")
+    extract_cache(
+        M, test_raw, cfg, groups=test_df.group.values, paths=test_df.path.values
+    ).save(f"{out}/cache_test.npz")
+    save_ood_reference(M, train_df, cfg, out)
     keras.backend.clear_session()
 
 

@@ -5,8 +5,11 @@ import numpy as np
 from PIL import Image
 from sklearn.ensemble import RandomForestClassifier
 
+from manifest_paths import normalize_manifest_path
+
 
 def features(paths, cache=None):
+    paths = [normalize_manifest_path(path) for path in paths]
     if cache and os.path.exists(cache):
         d = np.load(cache, allow_pickle=True)
         if list(d["paths"]) == list(paths): return d["X"]

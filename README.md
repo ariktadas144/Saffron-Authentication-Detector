@@ -1,6 +1,8 @@
-# Saffron authenticity: real vs fake
-ConvNeXt-Tiny + grid graph-attention (GNN) + HAFM fusion, with Wombat-OA-tuned weighted-beam decoding and log-probability fusion,
-evaluated with **sample-level cross-validation**.
+# Saffron authenticity research prototype
+
+Experiments with ConvNeXt-Tiny + grid graph-attention (GNN) + HAFM fusion and
+Wombat-OA weighted-beam decoding for real-vs-adulterated saffron images.
+Predictions are research outputs, not laboratory authentication.
 
 ## 0. Read this first: what is wrong with the original split
 Your files are named `<id>[ <TYPE>]_<shot>.jpg`. Several photos (shots) show the SAME physical sample, and **all 57 test samples
@@ -8,9 +10,11 @@ also appear in the training folder** (shots 1-3 in Training, shots 4-5 in Testin
 different sample IDs. Results on the original Training/Testing split would therefore be inflated. `prepare_dataset.py` rebuilds
 the splits so that every sample (and every duplicate-linked pair) lives in exactly one fold.
 
-Also measured on your data (group-CV, trivial features only): image size/aspect/file size -> AUC 0.79; mean/std of colour -> AUC 0.94.
-So colour alone is a strong baseline (included as a row in every table) and image resolution is a shortcut (the code uses square crops,
-resolution jitter, and capped working copies to reduce it).
+Simple image and capture features can correlate with class. The shortcut
+baselines are therefore part of the evaluation; high classification scores
+alone do not show that saffron-specific visual features were learned. See
+[the model card](docs/MODEL_CARD.md) and the generated audit report for
+evidence and limitations.
 
 ## 1. Folder structure
 ```
@@ -58,9 +62,10 @@ its own process to keep memory flat. Options: `--img-size 384`, `--batch 8` (out
 beam, to the weighted beam (untuned / random search / Wombat-OA) and the colour-statistics baseline.
 
 ## 5. How to check that it works
-**Code works (about 40 s, no dataset):** `pytest -m "not slow" -q` -> 14 passed (optimizer, beam == exhaustive search, GNN has no
-cross-sample leakage, MC-dropout only when sampling, weights reload, leak-free manifest builder, sample-level aggregation).
-**Pipeline works (about 5 min, CPU):** `pytest -m slow -q` -> 1 passed (the folder-based `train.py` / `decode.py` workflow).
+**Code checks:** run `pytest -m "not slow" -q`. The suite covers model,
+decoder, manifest, inference-safety, and utility behavior.
+**Slow pipeline check:** `pytest -m slow -q` exercises the folder-based
+`train.py` / `decode.py` workflow; it is not a research evaluation.
 **Your data works:** step 2 above finishes and writes `runs/smoke/fold0/ablation_test.csv`; `prepare_dataset.py` prints `[LEAK]` and `[DUP]`
 lines and per-fold counts of about 59-65 images / 11-13 samples.
 **Red flags:** deep models far below the colour baseline after the full run (more epochs / larger images / check ImageNet weights loaded);
@@ -95,10 +100,27 @@ This is the setting where fusion / beam / Wombat can differ from a plain average
 ## 7. Other data (folder workflow)
 `scripts/split_dataset.py`, `scripts/check_dataset.py`, `scripts/train.py`, `scripts/decode.py` work on a plain `data/{train,val,test}/{real,fake}` tree.
 
-## 8. Single-image Streamlit app
+## 8. Streamlit research app
 Install the frontend and inference dependencies, then run the app from the project root:
 ```bash
 pip install -r app/requirements_app.txt
 streamlit run app/streamlit_app.py
 ```
-The app loads trained fold checkpoints from `runs/cv1/fold*/`. Saved `wombat_params.json` and `thresholds.json` enable the tuned decoder; if those files are missing but weights and `config.json` exist, the deep model runs with the default decoder and a 0.5 threshold. If no usable deep checkpoint is found, the app trains a colour-statistics Random Forest from `data/manifest.csv`; without that manifest it uses a simple colour heuristic. Dataset archives, extracted images, manifests, and run outputs are intentionally excluded from Git.
+The deep path requires a complete, provenance-recorded fold ensemble and
+calibration matching the exact model artifacts and manifest. Missing or
+mismatched metadata causes the app to abstain rather than present an
+uncalibrated primary verdict. The colour-statistics Random Forest is a
+baseline-only mode and always displays **INCONCLUSIVE**. For an independent
+test, use the hash-locked procedure in
+[docs/preregistration.md](docs/preregistration.md). Dataset archives,
+extracted images, manifests, and run outputs are intentionally excluded from
+Git.
+
+## 9. Current evidence status
+
+Do not cite a deep-model performance number unless the complete run exists and
+passes the provenance gates in `scripts/build_report.py`. Partial checkpoints,
+CPU interruptions, and smoke-test outputs are not evaluation results. See
+[the model card](docs/MODEL_CARD.md) for the current limitations and
+[the project walkthrough](docs/README_PROJECT_EXPLAINED.md) for the intended
+workflow and interpretation.

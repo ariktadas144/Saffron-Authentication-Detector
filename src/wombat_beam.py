@@ -109,6 +109,7 @@ class Cache:
     view_names: list
     head_names: list
     groups: np.ndarray | None = None   # (N,) physical-sample id of each image (for sample-level aggregation)
+    paths: np.ndarray | None = None    # (N,) manifest path for cache/manifest alignment checks
 
     @property
     def shape(self):
@@ -116,6 +117,8 @@ class Cache:
 
     def save(self, path):
         extra = {} if self.groups is None else {"groups": np.asarray(self.groups).astype(str)}
+        if self.paths is not None:
+            extra["paths"] = np.asarray(self.paths).astype(str)
         np.savez_compressed(path, Z=self.Z, U=self.U, Sim=self.Sim, y=self.y,
                             view_names=np.array(self.view_names), head_names=np.array(self.head_names), **extra)
 
@@ -123,7 +126,8 @@ class Cache:
     def load(path):
         d = np.load(path, allow_pickle=False)
         g = d["groups"] if "groups" in d.files else None
-        return Cache(d["Z"], d["U"], d["Sim"], d["y"], list(d["view_names"]), list(d["head_names"]), g)
+        p = d["paths"] if "paths" in d.files else None
+        return Cache(d["Z"], d["U"], d["Sim"], d["y"], list(d["view_names"]), list(d["head_names"]), g, p)
 
     @staticmethod
     def synthetic(N=600, V=8, H=3, seed=0, sep=1.2):
@@ -307,21 +311,82 @@ def _macro_f1_fast(y, pred):
 def aggregate_by_group(p, y, groups, eps=1e-6):
     """Sample-level decision: fuse all photos (shots) of one physical sample by averaging their logits
     (= log-probability fusion across shots).  Returns (p_sample, y_sample)."""
-    g = np.asarray(groups); u, inv = np.unique(g, return_inverse=True)
+    p = np.asarray(p, dtype=float)
+    y = np.asarray(y, dtype=int)
+    g = np.asarray(groups)
+    if not (len(p) == len(y) == len(g)):
+        raise ValueError("p, y, and groups must have the same length")
+    u, inv = np.unique(g, return_inverse=True)
     lg = np.log(np.clip(p, eps, 1 - eps) / (1 - np.clip(p, eps, 1 - eps)))
     m = np.bincount(inv, weights=lg) / np.bincount(inv)
-    ys = np.zeros(len(u)); ys[inv] = y
-    return expit(m), ys.astype(int)
+    ys = np.empty(len(u), dtype=int)
+    for i, group in enumerate(u):
+        labels = np.unique(y[inv == i])
+        if len(labels) != 1:
+            display_group = group.item() if isinstance(group, np.generic) else group
+            raise ValueError(
+                f"group {display_group!r} has inconsistent labels: {labels.tolist()}"
+            )
+        ys[i] = labels[0]
+    return expit(m), ys
 
 
-def bootstrap_ci(y, p, thr=0.5, key="acc", n=1000, seed=0):
-    rng = np.random.default_rng(seed); y = np.asarray(y); vals = []
+def bootstrap_metrics_ci(y, p, thr=0.5, n=1000, seed=0, groups=None):
+    """Return percentile CIs for all metrics using a group-cluster bootstrap."""
+    rng = np.random.default_rng(seed)
+    y = np.asarray(y)
+    p = np.asarray(p)
+    if len(y) != len(p):
+        raise ValueError("y and p must have the same length")
+    g = np.arange(len(y)) if groups is None else np.asarray(groups)
+    if len(g) != len(y):
+        raise ValueError("groups must have the same length as y and p")
+    unique_groups = np.unique(g)
+    if len(unique_groups) == 0:
+        raise ValueError("bootstrap requires at least one group")
+    if n < 1:
+        raise ValueError("n must be at least 1")
+    rows_by_group = [np.flatnonzero(g == group) for group in unique_groups]
+    values = {}
     for _ in range(n):
-        i = rng.integers(0, len(y), len(y))
-        if len(np.unique(y[i])) < 2:
-            continue
-        vals.append(metrics(y[i], p[i], thr)[key])
-    return float(np.percentile(vals, 2.5)), float(np.percentile(vals, 97.5))
+        draws = rng.integers(0, len(unique_groups), len(unique_groups))
+        indices = np.concatenate([rows_by_group[index] for index in draws])
+        for key, value in metrics(y[indices], p[indices], thr).items():
+            if np.isfinite(value):
+                values.setdefault(key, []).append(value)
+    intervals = {}
+    for key, vals in values.items():
+        if vals:
+            intervals[key] = (
+                float(np.percentile(vals, 2.5)),
+                float(np.percentile(vals, 97.5)),
+            )
+    return intervals
+
+
+def bootstrap_ci(y, p, thr=0.5, key="acc", n=1000, seed=0, groups=None):
+    """Return one metric's percentile CI from a group-cluster bootstrap."""
+    intervals = bootstrap_metrics_ci(y, p, thr, n, seed, groups)
+    if key not in metrics(y, p, thr):
+        raise KeyError(key)
+    if key not in intervals:
+        return float("nan"), float("nan")
+    return intervals[key]
+
+
+def select_group_threshold(y, p, groups):
+    """Choose a sample-level threshold by macro-F1 on validation groups only."""
+    p_group, y_group = aggregate_by_group(p, y, groups)
+    candidates = np.unique(np.concatenate(([0.0], p_group, [1.0])))
+    scored = [
+        (_macro_f1_fast(y_group, (p_group >= threshold).astype(int)), threshold)
+        for threshold in candidates
+    ]
+    best_score = max(score for score, _ in scored)
+    return float(min(
+        (threshold for score, threshold in scored if score == best_score),
+        key=lambda threshold: (abs(threshold - 0.5), threshold),
+    ))
 
 
 # =====================================================================================
@@ -356,6 +421,30 @@ def tune(cache_val: Cache, method="wombat", pop=20, iters=25, seed=0, verbose=Fa
     return x, f, hist
 
 
+def tune_restricted(cache_val: Cache, pop=20, iters=25, seed=0, verbose=False, **fit_kw):
+    """Tune only H head weights, kappa, and theta; keep all other parameters at defaults."""
+    H, V = cache_val.shape[2], cache_val.shape[1]
+    names, lb, ub = param_spec(H, V)
+    selected_names = [*(f"a_{index}" for index in range(H)), "kappa", "theta"]
+    selected = np.asarray([names.index(name) for name in selected_names], dtype=int)
+    default = default_params(H, V)
+    fit = make_fitness(cache_val, **fit_kw)
+
+    def restricted_fitness(values):
+        full = default.copy()
+        full[selected] = values
+        return fit(full)
+
+    optimizer = WombatOptimizer(
+        restricted_fitness, lb[selected], ub[selected],
+        pop_size=pop, iters=iters, seed=seed, verbose=verbose,
+    )
+    values, score, history = optimizer.run()
+    full = default.copy()
+    full[selected] = values
+    return full, score, history
+
+
 # =====================================================================================
 # 6. Baselines for the ablation table (all on cached outputs -> identical inputs everywhere)
 # =====================================================================================
@@ -384,31 +473,82 @@ def b_logprob_fusion_no_beam(c: Cache):                    # equal-weight log-pr
     return expit(c.Z.mean((1, 2)))
 
 
-def evaluate_all(val: Cache, test: Cache, pop=20, iters=25, seed=0, extra_rows=None):
+def evaluate_all(
+    val: Cache, test: Cache, pop=20, iters=25, seed=0, extra_rows=None,
+    extra_val_probs=None, ci_samples=1000, restricted_decoder=False,
+):
     """Ablation table on TEST. Optimiser/threshold use VAL only."""
     import pandas as pd
     N, V, H = test.shape
-    rows = {}
+    rows, val_probs = {}, {}
     for h in test.head_names:
         rows[f"single view, {h}"] = (b_single(test, h), 0.5)
+        val_probs[f"single view, {h}"] = b_single(val, h)
     rows["late fusion (prob avg), identity view"] = (b_late_fusion_identity(test), 0.5)
+    val_probs["late fusion (prob avg), identity view"] = b_late_fusion_identity(val)
     rows["TTA mean-logit, hafm"] = (b_tta_mean_logit(test, test.head_names[-1]), 0.5)
+    val_probs["TTA mean-logit, hafm"] = b_tta_mean_logit(val, val.head_names[-1])
     rows["TTA top-k confidence (old), hafm"] = (b_tta_topk_conf(test, test.head_names[-1]), 0.5)
+    val_probs["TTA top-k confidence (old), hafm"] = b_tta_topk_conf(val, val.head_names[-1])
     rows["log-prob fusion, equal weights, no beam"] = (b_logprob_fusion_no_beam(test), 0.5)
+    val_probs["log-prob fusion, equal weights, no beam"] = b_logprob_fusion_no_beam(val)
     pd0 = unpack(default_params(H, V), H, V)
     rows["weighted beam + log-prob fusion (untuned)"] = (decode(test, pd0), pd0["theta"])
+    val_probs["weighted beam + log-prob fusion (untuned)"] = decode(val, pd0)
     xr, fr, _ = tune(val, "random", pop, iters, seed)
-    pr = unpack(xr, H, V); rows["weighted beam + log-prob fusion + random search"] = (decode(test, pr), pr["theta"])
+    pr = unpack(xr, H, V)
+    rows["weighted beam + log-prob fusion + random search"] = (decode(test, pr), pr["theta"])
+    val_probs["weighted beam + log-prob fusion + random search"] = decode(val, pr)
     xw, fw, hist = tune(val, "wombat", pop, iters, seed)
-    pw = unpack(xw, H, V); rows["PROPOSED: Wombat-OA + weighted beam + log-prob fusion"] = (decode(test, pw), pw["theta"])
+    pw = unpack(xw, H, V)
+    rows["PROPOSED: Wombat-OA + weighted beam + log-prob fusion"] = (decode(test, pw), pw["theta"])
+    val_probs["PROPOSED: Wombat-OA + weighted beam + log-prob fusion"] = decode(val, pw)
+    restricted_params = None
+    if restricted_decoder:
+        xr_small, restricted_fitness, restricted_history = tune_restricted(
+            val, pop=pop, iters=iters, seed=seed
+        )
+        restricted_params = unpack(xr_small, H, V)
+        restricted_name = "PROPOSED: restricted Wombat-OA decoder"
+        rows[restricted_name] = (decode(test, restricted_params), restricted_params["theta"])
+        val_probs[restricted_name] = decode(val, restricted_params)
     if extra_rows:                                       # e.g. {"colour-statistics random forest": (p, 0.5)}
         rows.update(extra_rows)
+        if extra_val_probs:
+            val_probs.update(extra_val_probs)
     table = pd.DataFrame({k: metrics(test.y, p, t) for k, (p, t) in rows.items()}).T
-    info = dict(params=pw, fitness=fw, history=hist, params_random=pr, probs={k: p for k, (p, _) in rows.items()},
+    info = dict(params=pw, fitness=fw, history=hist, params_random=pr,
+                params_restricted=restricted_params,
+                probs={k: p for k, (p, _) in rows.items()},
                 thr={k: t for k, (_, t) in rows.items()})
-    if test.groups is not None:                          # one decision per physical sample (all shots fused)
-        agg = {k: aggregate_by_group(p, test.y, test.groups) for k, (p, _) in rows.items()}
-        info["sample_table"] = pd.DataFrame({k: metrics(ys, ps, rows[k][1]) for k, (ps, ys) in agg.items()}).T
+    metric_keys = list(table.columns)
+    image_ci = {
+        method: bootstrap_metrics_ci(
+            test.y, probability, rows[method][1],
+            n=ci_samples, seed=seed, groups=test.groups,
+        )
+        for method, (probability, _) in rows.items()
+    }
+    sample_rows, sample_ci, sample_thresholds = {}, {}, {}
+    if test.groups is not None and val.groups is not None:
+        for method, (probability, _) in rows.items():
+            if method not in val_probs:
+                raise ValueError(f"validation predictions missing for {method!r}")
+            sample_threshold = select_group_threshold(val.y, val_probs[method], val.groups)
+            sample_thresholds[method] = sample_threshold
+            sample_groups = np.unique(test.groups)
+            sample_prob, sample_y = aggregate_by_group(
+                probability, test.y, test.groups
+            )
+            sample_rows[method] = metrics(sample_y, sample_prob, sample_threshold)
+            sample_ci[method] = bootstrap_metrics_ci(
+                sample_y, sample_prob, sample_threshold,
+                n=ci_samples, seed=seed, groups=sample_groups,
+            )
+        info["sample_table"] = pd.DataFrame(sample_rows).T
+        info["sample_ci"] = sample_ci
+        info["sample_thr"] = sample_thresholds
+    info["image_ci"] = image_ci
     return table, info
 
 

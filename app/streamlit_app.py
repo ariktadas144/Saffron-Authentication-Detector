@@ -11,6 +11,7 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import streamlit as st
 from PIL import Image, UnidentifiedImageError
 
@@ -221,6 +222,12 @@ hr { border-color: #2a2a3d; }
     border: 1px solid #2a2a3d;
     border-radius: 12px;
 }
+.verdict-neutral {
+    background: linear-gradient(135deg, #242438 0%, #303044 100%);
+    border: 2px solid #9ca3af55;
+    box-shadow: 0 0 40px #9ca3af18;
+}
+.verdict-neutral .verdict-label { color: #cbd5e1; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -301,7 +308,7 @@ with st.sidebar:
         )
         st.markdown(
             '<span class="status-dot dot-orange"></span>'
-            '<b style="color:#f5a623">Colour Baseline</b><br>'
+            '<b style="color:#f5a623">Baseline Mode (not primary)</b><br>'
             '<span style="color:#6666aa;font-size:.82rem">'
             f'RGB + HSV statistics<br>{baseline_label}<br>'
             'Train deep model for best results</span>',
@@ -319,6 +326,21 @@ with st.sidebar:
         st.caption("Baseline features: 64 × 64 centre crop · MC-Dropout: not used")
 
     st.markdown("---")
+    if bundle.run_metadata:
+        st.caption(
+            "Run config: "
+            f"seed {bundle.run_metadata.get('seed', 'unknown')} · "
+            f"image size {bundle.run_metadata.get('img_size', 'unknown')} · "
+            f"fine-tune epochs {bundle.run_metadata.get('epochs_ft', 'unknown')}"
+        )
+    if bundle.calibration:
+        st.caption(
+            "Calibration/data version: "
+            f"{str(bundle.calibration.get('model_version', 'unknown'))[:12]} / "
+            f"{str(bundle.calibration.get('data_version', 'unknown'))[:12]}"
+        )
+    else:
+        st.caption("Calibration unavailable or mismatched; primary verdicts abstain.")
     st.markdown('<div class="sidebar-label">About</div>', unsafe_allow_html=True)
     decoder_description = (
         "Wombat-OA tuned beam decoding"
@@ -342,24 +364,25 @@ st.markdown("""
 <div class="hero">
   <div style="font-size:3rem;margin-bottom:.3rem">🌿</div>
   <h1>Saffron Authenticity Detector</h1>
-  <p>Upload a saffron photo — get an instant real or fake verdict</p>
+  <p>Upload at least three shots of one physical sample for assessment</p>
 </div>
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Upload
 # ─────────────────────────────────────────────────────────────────────────────
-uploaded = st.file_uploader(
-    "Drop your saffron image here",
+uploads = st.file_uploader(
+    "Drop at least three saffron images of the same sample here",
     type=["jpg", "jpeg", "png", "webp"],
     label_visibility="collapsed",
+    accept_multiple_files=True,
 )
 
-if uploaded is None:
+if not uploads:
     st.markdown("""
     <div style="text-align:center;padding:2rem 0;color:#44445a;font-size:.9rem">
         📷 &nbsp; Accepted formats: JPG · PNG · WebP<br>
-        <span style="font-size:.78rem">Works best with close-up photos of dry saffron threads</span>
+        <span style="font-size:.78rem">Upload multiple views from the same physical sample</span>
     </div>
     """, unsafe_allow_html=True)
     st.stop()
@@ -368,16 +391,22 @@ if uploaded is None:
 # Image preview + analysis
 # ─────────────────────────────────────────────────────────────────────────────
 if bundle.method == "deep" and bundle.fallback_reason:
-    st.info(f"Deep model weights loaded. {bundle.fallback_reason}")
+    st.info(bundle.fallback_reason)
 
+pil_images = []
 try:
-    pil_img = Image.open(uploaded).convert("RGB")
+    for uploaded in uploads:
+        pil_images.append(Image.open(uploaded).convert("RGB"))
 except (UnidentifiedImageError, OSError) as exc:
-    st.error(f"Could not read the uploaded image: {exc}")
+    st.error(f"Could not read an uploaded image: {exc}")
     st.stop()
+pil_img = pil_images[0]
 
 if bundle.method == "colour":
-    baseline_message = "Using the colour-statistics baseline."
+    baseline_message = (
+        "Baseline mode only: the colour-statistics classifier is not the validated "
+        "primary model and cannot issue a REAL/FAKE verdict."
+    )
     if bundle.fallback_reason:
         baseline_message += f" {bundle.fallback_reason}"
     st.warning(baseline_message)
@@ -388,7 +417,10 @@ with col_img:
     st.markdown('<div class="section-title">📸 Uploaded Image</div>',
                 unsafe_allow_html=True)
     st.image(pil_img, use_container_width=True,
-             caption=f"{uploaded.name}  ·  {pil_img.size[0]}×{pil_img.size[1]} px")
+             caption=f"{uploads[0].name}  ·  {pil_img.size[0]}×{pil_img.size[1]} px")
+    if len(pil_images) > 1:
+        with st.expander(f"View remaining shots ({len(pil_images) - 1})"):
+            st.image(pil_images[1:], use_container_width=True)
 
 with col_res:
     st.markdown('<div class="section-title">🔬 Analysis</div>',
@@ -397,42 +429,40 @@ with col_res:
     # Run inference
     with st.spinner("Analysing…"):
         t0 = time.perf_counter()
-        from predict import predict_image
-        result = predict_image(pil_img, model_bundle=bundle)
+        from predict import predict_images
+        result = predict_images(pil_images, model_bundle=bundle)
         elapsed = time.perf_counter() - t0
 
     label      = result["label"]
-    confidence = result["confidence"]
     p_fake     = result["p_fake"]
     method     = result["method"]
 
     # Verdict card
-    card_cls = "verdict-real" if label == "REAL" else "verdict-fake"
-    emoji     = "✅" if label == "REAL" else "🚫"
-    colour    = "#22c55e" if label == "REAL" else "#ef4444"
+    card_cls = (
+        "verdict-real" if label == "REAL"
+        else "verdict-fake" if label == "FAKE"
+        else "verdict-neutral"
+    )
+    emoji = "✅" if label == "REAL" else "🚫" if label == "FAKE" else "⚠️"
 
     st.markdown(f"""
     <div class="verdict-card {card_cls}">
       <div class="verdict-emoji">{emoji}</div>
       <p class="verdict-label">{label}</p>
       <div class="verdict-conf">
-        Confidence: <strong>{confidence*100:.1f}%</strong>
+        P(fake): <strong>{p_fake*100:.1f}%</strong>
       </div>
     </div>
     """, unsafe_allow_html=True)
 
-    # Confidence bar
-    st.markdown(_conf_bar(confidence, label), unsafe_allow_html=True)
-    st.markdown(
-        f'<div style="display:flex;justify-content:space-between;'
-        f'color:#6666aa;font-size:.78rem">'
-        f'<span>0%</span><span style="color:{colour};font-weight:600">'
-        f'{confidence*100:.1f}%</span><span>100%</span></div>',
-        unsafe_allow_html=True,
-    )
+    st.progress(float(np.clip(p_fake, 0.0, 1.0)), text="P(fake)")
+    if label == "INCONCLUSIVE":
+        st.warning("No primary verdict. " + "; ".join(
+            result["details"].get("abstention_reasons", [])
+        ))
 
     # Meta row
-    method_lbl = "Deep Model (CNN+GNN+HAFM)" if method == "deep" else "Colour Baseline"
+    method_lbl = "Deep Model (CNN+GNN+HAFM)" if method == "deep" else "Baseline Mode (non-primary)"
     folds_used = result.get("folds_used", 0)
     meta_txt = method_lbl
     if method == "deep" and folds_used > 1:
@@ -441,7 +471,7 @@ with col_res:
                 unsafe_allow_html=True)
     st.markdown(
         f'<div style="color:#44445a;font-size:.75rem;margin-top:.4rem">'
-        f'Processed in {elapsed*1000:.0f} ms</div>',
+        f'Processed in {elapsed*1000:.0f} ms · {len(pil_images)} shots</div>',
         unsafe_allow_html=True,
     )
 
@@ -451,16 +481,25 @@ with col_res:
 st.markdown("---")
 col_a, col_b, col_c = st.columns(3)
 with col_a:
-    st.metric("P(Fake)", f"{p_fake*100:.1f}%",
-              delta=f"{(p_fake-0.5)*100:+.1f}% from 50%",
-              delta_color="inverse")
+    st.metric("P(Fake)", f"{p_fake*100:.1f}%")
 with col_b:
     thr = result.get("threshold", 0.5)
     st.metric("Decision Threshold", f"{thr*100:.1f}%")
 with col_c:
-    st.metric("Verdict", label,
-              delta="↑ Confidence" if confidence > 0.7 else "⚠ Low confidence",
-              delta_color="normal" if label == "REAL" else "inverse")
+    st.metric("Verdict", label)
+
+if method == "deep":
+    st.caption(
+        f"Fold ensemble spread: {np.std(result.get('per_fold_probs', [])):.4f} · "
+        f"MC uncertainty: {result['details'].get('mc_uncertainty', float('nan')):.4f} · "
+        f"Embedding OOD ratio: {result['details'].get('ood_ratio')}"
+    )
+    st.caption("Evidence for the decision is limited to the calibrated prediction set, capture metadata, and model agreement.")
+st.info(
+    "Research prototype, not a laboratory test. The available dataset is small and has documented "
+    "capture confounds. A result is not evidence of performance on new phones, sessions, or lighting. "
+    "Empirical calibration is scoped to data similar to its calibration set."
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Colour feature breakdown
@@ -487,7 +526,13 @@ if per_fold and len(per_fold) > 1:
         df = pd.DataFrame({
             "Fold": [f"Fold {i}" for i in range(len(per_fold))],
             "P(Fake)": [f"{p*100:.1f}%" for p in per_fold],
-            "Verdict": ["FAKE" if p >= 0.5 else "REAL" for p in per_fold],
+            "Verdict": [
+                "FAKE" if p >= t else "REAL"
+                for p, t in zip(
+                    per_fold,
+                    result["details"].get("per_fold_thresholds", [0.5] * len(per_fold)),
+                )
+            ],
         })
         st.dataframe(df, hide_index=True, use_container_width=True)
 
@@ -522,8 +567,8 @@ with st.expander("ℹ️ How it works"):
 5. **8 colour-preserving test-time views** (identity, flips, rotations, crops) are extracted
 6. {decoder_step}
 
-**Fallback** (when no weights exist):
-RGB mean/std + HSV mean/std on a 64×64 crop → Random Forest trained on the full manifest. Achieves ~0.94 AUC on the saffron dataset.
+**Baseline mode** (when no weights exist): RGB/HSV statistics may be displayed as a
+non-primary comparison only. It does not issue a REAL/FAKE verdict.
 
 **What "fake" means in this dataset:**
 Adulterated saffron samples labelled with types `-`, `C`, `S`, `M` (adulterant types from filenames).
@@ -535,8 +580,7 @@ Adulterated saffron samples labelled with types `-`, `C`, `S`, `M` (adulterant t
 st.markdown("---")
 st.markdown(
     '<div style="text-align:center;color:#33334a;font-size:.78rem;padding:.5rem 0">'
-    'Saffron Authenticity Detector · ConvNeXt + GNN + HAFM + Wombat-OA · '
-    'Sample-level group-CV · '
+    'Saffron Authenticity Detector · research prototype · '
     '<span style="color:#f5a62366">🌿</span>'
     '</div>',
     unsafe_allow_html=True,

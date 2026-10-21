@@ -2,6 +2,11 @@
 __pycache__/
 runs/*
 !runs/.gitkeep
+!runs/audit/
+runs/audit/*
+!runs/audit/REPORT.md
+!runs/audit/PHASE2_REPORT.md
+!runs/audit/shortcut_baselines.csv
 data/*.zip
 data/manifest*.csv
 data/extracted/

@@ -35,5 +35,5 @@ P = info["params"]; p_prop = wb.decode(test, P); p_base = wb.b_tta_mean_logit(te
 print("\nbootstrap 95% CI on TEST")
 for name, p, thr in [("proposed", p_prop, P["theta"]), ("TTA mean-logit", p_base, 0.5)]:
     for k in ("acc", "f1_fake", "auc"):
-        print(f"  {name:16s}{k:8s}{wb.metrics(test.y, p, thr)[k]:.4f}  CI {tuple(round(x, 4) for x in wb.bootstrap_ci(test.y, p, thr, k))}")
+        print(f"  {name:16s}{k:8s}{wb.metrics(test.y, p, thr)[k]:.4f}  CI {tuple(round(x, 4) for x in wb.bootstrap_ci(test.y, p, thr, k, groups=test.groups))}")
 print("DONE ->", a.out)

@@ -5,6 +5,15 @@ import json
 
 from PIL import Image
 
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(ROOT / "src"))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 import saffron_cnn_gnn as sg
 from app.predict import load_model, predict_image
 
@@ -31,8 +40,8 @@ def test_colour_baseline_loads_from_manifest_without_run_directory(tmp_path):
 
     assert bundle.method == "colour"
     assert bundle.colour_clf is not None
-    assert result["label"] in {"REAL", "FAKE"}
-    assert 0.0 <= result["confidence"] <= 1.0
+    assert result["label"] == "INCONCLUSIVE"
+    assert result["baseline_label"] in {"REAL", "FAKE"}
     assert result["method"] == "colour"
     assert result["details"]["baseline_trained"] is True
     assert set(result["details"]["colour_features"]) == {
@@ -51,11 +60,13 @@ def test_colour_heuristic_is_available_without_manifest(tmp_path):
     assert bundle.method == "colour"
     assert bundle.colour_clf is None
     assert result["method"] == "colour"
+    assert result["label"] == "INCONCLUSIVE"
+    assert result["baseline_label"] in {"REAL", "FAKE"}
     assert result["details"]["baseline_trained"] is False
     assert "Manifest not found" in result["details"]["fallback_reason"]
 
 
-def test_deep_weights_without_decoder_metadata_use_default_parameters(
+def test_partial_unversioned_deep_weights_are_not_loaded(
     tmp_path, monkeypatch
 ):
     fold_dir = tmp_path / "fold0"
@@ -71,8 +82,6 @@ def test_deep_weights_without_decoder_metadata_use_default_parameters(
 
     bundle = load_model(str(tmp_path), str(tmp_path / "missing-manifest.csv"))
 
-    assert bundle.method == "deep"
-    assert bundle.decoder_tuned is False
-    assert bundle.folds[0]["wparams"]["theta"] == 0.5
-    assert bundle.folds[0]["thr"] == {}
-    assert "untuned decoder" in bundle.fallback_reason
+    assert bundle.method == "colour"
+    assert not bundle.folds
+    assert "complete, provenance-recorded fold ensemble" in bundle.fallback_reason
