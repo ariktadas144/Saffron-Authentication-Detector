@@ -27,7 +27,10 @@ ap.add_argument("--capture-invariant", action="store_true")
 ap.add_argument("--restricted-decoder", action="store_true")
 a = ap.parse_args()
 KEYS = ["acc", "bal_acc", "f1_fake", "recall_fake", "specificity", "auc", "ece"]
-METADATA_COLUMNS = {"path", "group", "y", "fold", "camera", "flash_status", "iso"}
+METADATA_COLUMNS = {
+    "path", "group", "y", "fold", "camera", "flash_status", "iso",
+    "capture_date", "type",
+}
 
 
 def _shift_to_threshold(probability, threshold):
