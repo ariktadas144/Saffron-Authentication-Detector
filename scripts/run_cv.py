@@ -240,10 +240,13 @@ def aggregate(out):
         ]:
             subset = data.loc[mask]
             for method in methods:
-                ci = wb.bootstrap_metrics_ci(
-                    np.ones(len(subset), dtype=int),
-                    subset[method].to_numpy(),
-                    n=1000, seed=42, groups=subset.group.to_numpy(),
+                ci = (
+                    wb.bootstrap_metrics_ci(
+                        np.ones(len(subset), dtype=int),
+                        subset[method].to_numpy(),
+                        n=1000, seed=42, groups=subset.group.to_numpy(),
+                    )
+                    if not subset.empty else {}
                 )
                 subgroup_rows.append({
                     "level": level_name,
