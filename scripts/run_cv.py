@@ -383,12 +383,9 @@ if not a.aggregate_only:
             ]
             pd.DataFrame(ci_rows).to_csv(f"{od}/{filename}", index=False)
         json.dump({q: (v.tolist() if hasattr(v, "tolist") else v) for q, v in info["params"].items()}, open(f"{od}/wombat_params.json", "w"), indent=1)
-        random_params = wb.unpack(
-            info["params_random"], test.Z.shape[2], test.Z.shape[1]
-        )
         json.dump({
             q: (v.tolist() if hasattr(v, "tolist") else v)
-            for q, v in random_params.items()
+            for q, v in info["params_random"].items()
         }, open(f"{od}/wombat_params_random.json", "w"), indent=1)
         if info.get("params_restricted") is not None:
             json.dump({

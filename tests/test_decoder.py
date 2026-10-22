@@ -115,3 +115,7 @@ def test_evaluate_all_returns_group_bootstrap_intervals(monkeypatch):
     assert method in info["sample_thr"]
     assert set(info["image_ci"][method]) == set(table.columns)
     assert set(info["sample_ci"][method]) == set(table.columns)
+    assert isinstance(info["params_random"], dict)
+    assert {"a", "tau", "beta", "gamma", "alpha", "beam", "depth", "kappa", "theta"} <= set(
+        info["params_random"]
+    )
