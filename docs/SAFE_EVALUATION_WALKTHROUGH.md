@@ -72,6 +72,13 @@ Observed GPU list: `[]`. The package versions above are from this checkout's
 current Python environment; do not merge them with version tables recorded
 for earlier runs in other environments.
 
+For Colab, `notebooks/run_on_colab.ipynb` pins NumPy 2.2.6, SciPy 1.16.3,
+TensorFlow 2.20.0, Keras 3.13.0, pandas 2.2.3, scikit-learn 1.6.1, and
+Pillow 12.2.0. It installs these in a dedicated step and requires a runtime
+restart before importing TensorFlow/SciPy, then checks the versions and GPU.
+This pinned set is a compatibility precaution for Colab's Python 3.13 runtime;
+it has not been verified by a completed Colab run in this checkout.
+
 ## Verification commands
 
 ```powershell
